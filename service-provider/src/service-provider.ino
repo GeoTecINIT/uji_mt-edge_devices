@@ -31,6 +31,7 @@ RestAPIEndpoints apiEndPoints;
 RdWebServer* webServer;
 
 byte CurrentLocation[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+byte CurrentRegionID = 0;
 
 void cloneConstChar(const char* src, char* dest) {
   int length = strlen(src);
@@ -134,7 +135,7 @@ bool JSONGetValue(JSONValue* value, String propertyName, JSONValue* out) {
   return false;
 }
 
-int fogApiGet(String path, JSONValue* jsonValue) {
+int fogApiGet(String path, JSONValue* jsonValue, String hostname, int port) {
   HttpClient http;
   http_header_t headers[] = {
     {"Content-Type", "application/json"},
@@ -145,8 +146,8 @@ int fogApiGet(String path, JSONValue* jsonValue) {
   http_request_t request;
   http_response_t response;
 
-  request.hostname = FogAPIHostName;
-  request.port = FogAPIPort;
+  request.hostname = hostname;
+  request.port = port;
   request.path = path;
 
   http.get(request, response, headers);
@@ -155,26 +156,72 @@ int fogApiGet(String path, JSONValue* jsonValue) {
   return response.status;
 }
 
-void testFogAPI() {
+int fogApiGet(String path, JSONValue* jsonValue) {
+  return fogApiGet(path, jsonValue, FogAPIHostName, FogAPIPort);
+}
+
+bool fogApiGetData(String path, JSONValue* data, String hostname, int port) {
+  JSONValue response;
+  fogApiGet(path, &response, hostname, port);
+  if (!response.isValid()) {
+    ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_FAIL", path);
+    return false;
+  }
+
+  bool ok;
+  if (!JSONGetBool(&response, "ok", &ok) || !ok || !JSONGetValue(&response, "data", data)) {
+    ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_FAIL", path);
+    return false;
+  }
+
+  return true;
+}
+
+bool fogApiGetData(String path, JSONValue* data) {
+  return fogApiGetData(path, data, FogAPIHostName, FogAPIPort);
+}
+
+bool testHostname(String hostname) {
+  JSONValue data;
+  return fogApiGetData("/alive", &data, hostname, FogAPIPort);
+}
+
+void testFogUpdateState() {
   ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_TEST");
-  JSONValue responseJson;
-  int status = fogApiGet("/alive", &responseJson);
-  if (responseJson.isValid()) {
-    bool ok;
-    JSONGetBool(&responseJson, "ok", &ok);
-    if (ok) {
-      ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_OK");
-      setState(STATE_IDLE);
-      return;
-    } else {
-      String message;
-      JSONGetString(&responseJson, "msg", &message);
-      ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_FAIL", message);
-      setState(STATE_LOST);
-    }
+  if (testHostname(FogAPIHostName)) {
+    ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_OK");
+    setState(STATE_IDLE);
   } else {
-    ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_FAIL", String(status));
     setState(STATE_LOST);
+  }
+}
+
+void updateHostname(String newHostname) {
+  if (newHostname.compareTo(FogAPIHostName) != 0) {
+    JSONValue data;
+    if (testHostname(newHostname)) {
+      FogAPIHostName = newHostname;
+      ((VERBOSITY) & (VERBOSITY_GENERAL)) && Particle.publish("FOG_UPDATED", FogAPIHostName);
+    }
+  }
+}
+
+void updateRegionID(byte newID) {
+  if (CurrentRegionID != newID) {
+    CurrentRegionID = newID;
+    ((VERBOSITY) & (VERBOSITY_GENERAL)) && Particle.publish("REGION_UPDATED", String(CurrentRegionID));
+  }
+}
+
+void checkRegion() {
+  JSONValue data;
+  if (fogApiGetData("/region/query/" + bytesToHex(CurrentLocation, 8), &data)) {
+    int regionID;
+    String ipv4;
+    if (JSONGetInt(&data, "id", &regionID) && JSONGetString(&data, "ipv4", &ipv4)) {
+      updateRegionID(regionID);
+      updateHostname(ipv4);
+    }
   }
 }
 
@@ -183,6 +230,7 @@ void setLocation(byte* location) {
     CurrentLocation[i] = location[i];
   }
   ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("LOCATION_UPDATED", bytesToHex(CurrentLocation, 8));
+  checkRegion();
 }
 
 void apiReturnSuccess(String& response, char* data) {
@@ -234,7 +282,7 @@ void apiSetFogIp(RestAPIEndpointMsg& request, String& response) {
     return;
   }
   apiReturnSuccess(response, NULL);
-  testFogAPI();
+  testFogUpdateState();
 }
 
 void apiGetLocation(RestAPIEndpointMsg& request, String& response) {
@@ -271,7 +319,7 @@ void apiSetLocation(RestAPIEndpointMsg& request, String& response) {
 void setup() {
   ((VERBOSITY) & (VERBOSITY_GENERAL)) && Particle.publish("DEVICE_START");
   setupAPI();
-  testFogAPI();
+  testFogUpdateState();
 }
 
 void loop() {
@@ -307,7 +355,7 @@ void loopLost() {
   webServer->service();
 
   if (Time.second() == 0) {
-    testFogAPI();
+    testFogUpdateState();
   }
 }
 

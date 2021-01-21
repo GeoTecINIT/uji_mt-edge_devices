@@ -25,7 +25,7 @@ bool JSONGetInt(JSONValue* value, String propertyName, int* out);
 bool JSONGetString(JSONValue* value, String propertyName, String* out);
 bool JSONGetValue(JSONValue* value, String propertyName, JSONValue* out);
 int fogApiGet(String path, JSONValue* jsonValue);
-void testFogAPI();
+void testFogUpdateState();
 void setLocation(byte* location);
 void apiReturnSuccess(String& response, char* data);
 void apiReturnFail(String& response, String msg, char* data);
@@ -190,7 +190,7 @@ int fogApiGet(String path, JSONValue* jsonValue) {
   return response.status;
 }
 
-void testFogAPI() {
+void testFogUpdateState() {
   ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_TEST");
   JSONValue responseJson;
   int status = fogApiGet("/alive", &responseJson);
@@ -274,7 +274,7 @@ void apiSetFogIp(RestAPIEndpointMsg& request, String& response) {
     return;
   }
   apiReturnSuccess(response, NULL);
-  testFogAPI();
+  testFogUpdateState();
 }
 
 void apiGetLocation(RestAPIEndpointMsg& request, String& response) {
@@ -313,7 +313,7 @@ void apiSetLocation(RestAPIEndpointMsg& request, String& response) {
 void setup() {
   ((VERBOSITY) & (VERBOSITY_GENERAL)) && Particle.publish("DEVICE_START");
   setupAPI();
-  testFogAPI();
+  testFogUpdateState();
 }
 
 void loop() {
@@ -349,7 +349,7 @@ void loopLost() {
   webServer->service();
 
   if (Time.second() == 0) {
-    testFogAPI();
+    testFogUpdateState();
   }
 }
 
