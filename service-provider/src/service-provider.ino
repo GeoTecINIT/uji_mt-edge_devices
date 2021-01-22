@@ -309,7 +309,7 @@ bool fogApiPostTransaction(String path, String body, String* txHash) {
 bool fogPostSignSubmitTransaction(String path, String body) {
   ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_REQTX_REGISTER", body);
   String txHashStr;
-  if (!fogApiPostTransaction("/device/register/tx", body, &txHashStr)) {
+  if (!fogApiPostTransaction(path, body, &txHashStr)) {
     return false;
   }
 
@@ -321,16 +321,11 @@ bool fogPostSignSubmitTransaction(String path, String body) {
   int tryCount = 0;
   while (tryCount++ < TX_SUBMIT_TRY_COUNT) {
     byte* signatures = new byte[64];
-    int signStatus = uECC_sign(EthPrivate, txHash, 32, signatures, uECC_secp256k1());
-    if (signStatus != 1) {
-      Particle.publish("DEBUG_SIG_FAIL", String(signStatus));
-      delay(500);
+    if (uECC_sign(EthPrivate, txHash, 32, signatures, uECC_secp256k1()) != 1) {
       continue;
     }
 
     if (uECC_verify(publicKey, txHash, 32, signatures, uECC_secp256k1()) != 1) {
-      Particle.publish("DEBUG_UNVERIFIED_SIG", bytesToHex(signatures, 64));
-      delay(500);
       continue;
     }
 
@@ -342,12 +337,8 @@ bool fogPostSignSubmitTransaction(String path, String body) {
     sprintf(vHex, "0x%x", v);
 
     String submitSignatureBody = "{\"tx\":\"" + bytesToHex(txHash, 32) + "\","
-      + "\"priv\":\"" + bytesToHex(EthPrivate, 32) + "\","
-      + "\"signature\":\"" + bytesToHex(signatures, 64) + "\","
       + "\"r\":\"" + bytesToHex(r, 32) + "\",\"s\":\"" + bytesToHex(s, 32) + "\","
       + "\"v\":\"" + vHex + "\"}";
-    Particle.publish("DEBUG", submitSignatureBody);
-    delay(500);
 
     JSONValue* dataResponse;
     if (fogApiPostData("/transaction/submit-signature", submitSignatureBody, dataResponse)) {
@@ -405,11 +396,25 @@ void checkRegion() {
 }
 
 void setLocation(byte* location) {
+  if (!validLocation(location)) {
+    return;
+  }
+
   for (int i = 0; i < 8; i++) {
     CurrentLocation[i] = location[i];
   }
   ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("LOCATION_UPDATED", bytesToHex(CurrentLocation, 8));
   checkRegion();
+
+  fogPostSignSubmitTransaction("/device/update/location/tx", "{\"location\":\"" + bytesToHex(CurrentLocation, 8) + "\"}");
+}
+
+bool validLocation(byte* location) {
+  byte checking = 0x0;
+  for (int i = 0; i < 8; i++) {
+    checking |= location[i];
+  }
+  return checking != 0x0;
 }
 
 void splitSignatures(byte* signatures, byte* r, byte* s, int* v) {
@@ -422,9 +427,21 @@ void splitSignatures(byte* signatures, byte* r, byte* s, int* v) {
   *v = (EthChainID * 2) + 35;
 }
 
+void checkDataForUpdate(JSONValue* data) {
+  String ipv4;
+  if (JSONGetString(data, "ipv4", &ipv4)) {
+    String localIP = LocalIP.toString();
+    if (ipv4.compareTo(localIP) != 0) {
+      fogPostSignSubmitTransaction("/device/update/ip/tx",
+        "{\"ipv4\":\"" + localIP + "\",\"ipv6\":null}");
+    }
+  }
+}
+
 bool isRegistered() {
   JSONValue data;
-  return fogApiGetData("/device/get/" + EthAddress, &data);
+  bool registered = fogApiGetData("/device/get/" + EthAddress, &data);
+  return registered;
 }
 
 void registerDeviceToFog() {
@@ -458,6 +475,14 @@ void apiReturnInvalidInput(String& response) {
 bool apiRequireMethod(RestAPIEndpointMsg& request, String& response, int method) {
   if (request._method != method) {
     apiReturnFail(response, "Invalid Method", NULL);
+    return false;
+  }
+  return true;
+}
+
+bool apiRequireState(RestAPIEndpointMsg& request, String& response, int state) {
+  if (CurrentState != state) {
+    apiReturnFail(response, "Not now", NULL);
     return false;
   }
   return true;
@@ -594,9 +619,11 @@ void loopLost() {
 }
 
 void loopIdle() {
-  if (!RegisteredChecked && !isRegistered()) {
+  if (!RegisteredChecked) {
     RegisteredChecked = true;
-    registerDeviceToFog();
+    if (!isRegistered()) {
+      registerDeviceToFog();
+    }
   }
   webServer->service();
 }
