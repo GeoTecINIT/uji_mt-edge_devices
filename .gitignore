@@ -56,3 +56,4 @@
 # End of https://www.toptal.com/developers/gitignore/api/c++,particle,vscode
 
 */target/*
+service-provider/utils.txt

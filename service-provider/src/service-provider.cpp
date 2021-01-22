@@ -11,7 +11,7 @@
 #include "HttpClient.h"
 #include "RdWebServer.h"
 #include "RestAPIEndpoints.h"
-
+#include "uECC.h" // https://github.com/kmackay/micro-ecc
 
 void cloneConstChar(const char* src, char* dest);
 void setState(int newState);
@@ -24,8 +24,15 @@ bool JSONGetDouble(JSONValue* value, String propertyName, double* out);
 bool JSONGetInt(JSONValue* value, String propertyName, int* out);
 bool JSONGetString(JSONValue* value, String propertyName, String* out);
 bool JSONGetValue(JSONValue* value, String propertyName, JSONValue* out);
+int fogApiGet(String path, JSONValue* jsonValue, String hostname, int port);
 int fogApiGet(String path, JSONValue* jsonValue);
+bool fogApiGetData(String path, JSONValue* data, String hostname, int port);
+bool fogApiGetData(String path, JSONValue* data);
+bool testHostname(String hostname);
 void testFogUpdateState();
+void updateHostname(String newHostname);
+void updateRegionID(byte newID);
+void checkRegion();
 void setLocation(byte* location);
 void apiReturnSuccess(String& response, char* data);
 void apiReturnFail(String& response, String msg, char* data);
@@ -35,6 +42,7 @@ void apiAlive(RestAPIEndpointMsg& request, String& response);
 void apiSetFogIp(RestAPIEndpointMsg& request, String& response);
 void apiGetLocation(RestAPIEndpointMsg& request, String& response);
 void apiSetLocation(RestAPIEndpointMsg& request, String& response);
+void apiSetEthAccount(RestAPIEndpointMsg& request, String& response);
 void setup();
 void loop();
 void setupAPI();
@@ -62,10 +70,14 @@ int CurrentState = STATE_STARTUP;
 String FogAPIHostName = "192.168.1.236";
 int FogAPIPort = 80;
 
+String EthAddress = "";
+String EthPrivate = "";
+
 RestAPIEndpoints apiEndPoints;
 RdWebServer* webServer;
 
 byte CurrentLocation[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+byte CurrentRegionID = 0;
 
 void cloneConstChar(const char* src, char* dest) {
   int length = strlen(src);
@@ -169,7 +181,7 @@ bool JSONGetValue(JSONValue* value, String propertyName, JSONValue* out) {
   return false;
 }
 
-int fogApiGet(String path, JSONValue* jsonValue) {
+int fogApiGet(String path, JSONValue* jsonValue, String hostname, int port) {
   HttpClient http;
   http_header_t headers[] = {
     {"Content-Type", "application/json"},
@@ -180,8 +192,8 @@ int fogApiGet(String path, JSONValue* jsonValue) {
   http_request_t request;
   http_response_t response;
 
-  request.hostname = FogAPIHostName;
-  request.port = FogAPIPort;
+  request.hostname = hostname;
+  request.port = port;
   request.path = path;
 
   http.get(request, response, headers);
@@ -190,39 +202,81 @@ int fogApiGet(String path, JSONValue* jsonValue) {
   return response.status;
 }
 
+int fogApiGet(String path, JSONValue* jsonValue) {
+  return fogApiGet(path, jsonValue, FogAPIHostName, FogAPIPort);
+}
+
+bool fogApiGetData(String path, JSONValue* data, String hostname, int port) {
+  JSONValue response;
+  fogApiGet(path, &response, hostname, port);
+  if (!response.isValid()) {
+    ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_FAIL", path);
+    return false;
+  }
+
+  bool ok;
+  if (!JSONGetBool(&response, "ok", &ok) || !ok || !JSONGetValue(&response, "data", data)) {
+    ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_FAIL", path);
+    return false;
+  }
+
+  return true;
+}
+
+bool fogApiGetData(String path, JSONValue* data) {
+  return fogApiGetData(path, data, FogAPIHostName, FogAPIPort);
+}
+
+bool testHostname(String hostname) {
+  JSONValue data;
+  return fogApiGetData("/alive", &data, hostname, FogAPIPort);
+}
+
 void testFogUpdateState() {
   ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_TEST");
-  JSONValue responseJson;
-  int status = fogApiGet("/alive", &responseJson);
-  if (responseJson.isValid()) {
-    bool ok;
-    JSONGetBool(&responseJson, "ok", &ok);
-    if (ok) {
-      ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_OK");
-      setState(STATE_IDLE);
-      return;
-    } else {
-      String message;
-      JSONGetString(&responseJson, "msg", &message);
-      ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_FAIL", message);
-      setState(STATE_LOST);
-    }
+  if (testHostname(FogAPIHostName)) {
+    ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_OK");
+    setState(STATE_IDLE);
   } else {
-    ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("FOG_FAIL", String(status));
     setState(STATE_LOST);
   }
 }
 
-void setLocation(byte* location) {
-  if (sizeof(location) != 8) {
-    ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("LOCATION_SET_REJECTED", String(sizeof(location)));
-    return;
+void updateHostname(String newHostname) {
+  if (newHostname.compareTo(FogAPIHostName) != 0) {
+    JSONValue data;
+    if (testHostname(newHostname)) {
+      FogAPIHostName = newHostname;
+      ((VERBOSITY) & (VERBOSITY_GENERAL)) && Particle.publish("FOG_UPDATED", FogAPIHostName);
+    }
   }
-  ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("LOCATION_SET");
+}
+
+void updateRegionID(byte newID) {
+  if (CurrentRegionID != newID) {
+    CurrentRegionID = newID;
+    ((VERBOSITY) & (VERBOSITY_GENERAL)) && Particle.publish("REGION_UPDATED", String(CurrentRegionID));
+  }
+}
+
+void checkRegion() {
+  JSONValue data;
+  if (fogApiGetData("/region/query/" + bytesToHex(CurrentLocation, 8), &data)) {
+    int regionID;
+    String ipv4;
+    if (JSONGetInt(&data, "id", &regionID) && JSONGetString(&data, "ipv4", &ipv4)) {
+      updateRegionID(regionID);
+      updateHostname(ipv4);
+    }
+  }
+}
+
+void setLocation(byte* location) {
   for (int i = 0; i < 8; i++) {
     CurrentLocation[i] = location[i];
   }
   ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("LOCATION_UPDATED", bytesToHex(CurrentLocation, 8));
+  checkRegion();
 }
 
 void apiReturnSuccess(String& response, char* data) {
@@ -305,9 +359,19 @@ void apiSetLocation(RestAPIEndpointMsg& request, String& response) {
   }
   apiReturnSuccess(response, NULL);
 
-  byte* cells;
-  cells = hexToBytes(cellHex);
-  setLocation(cells);
+  setLocation(hexToBytes(cellHex));
+}
+
+void apiSetEthAccount(RestAPIEndpointMsg& request, String& response) {
+  ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("API_SET_ETHACC");
+  if (!apiRequireMethod(request, response, API_METHOD_POST)) {
+    return;
+  }
+
+  JSONValue value = JSONValue::parseCopy((char*)request._pMsgContent);
+  if (!JSONGetString(&value, "address", &EthAddress)) {
+    return;
+  }
 }
 
 void setup() {
