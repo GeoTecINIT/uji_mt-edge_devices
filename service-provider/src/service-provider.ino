@@ -5,6 +5,7 @@
 #include "HttpClient.h"
 #include "RdWebServer.h"
 #include "RestAPIEndpoints.h"
+#include "DHT.h"
 #include "uECC.h" // https://github.com/kmackay/micro-ecc
 
 #define byte            uint8_t
@@ -29,6 +30,19 @@
 
 #define UNCONECCTED_RANDOM_PIN  A0
 
+#define MAX_CONNECTION_LENGTH   5
+
+#define SENSOR_DHT_PIN  D2
+#define SENSOR_DHT_TYPE DHT11
+
+typedef void (*ServiceFunction)(String&);
+
+struct ServiceConnection {
+  byte* token;
+  int serviceIndex;
+  int expiration;
+};
+
 int CurrentState = STATE_STARTUP;
 
 IPAddress LocalIP;
@@ -43,13 +57,20 @@ byte* EthPrivate = new byte[32];
 int EthChainID = 0;
 
 String Services[] = {"TEMP", "HUMD"};
+ServiceFunction ServiceFunctions[2];
 int ServiceLength = 2;
+
+ServiceConnection* ServiceConnections[MAX_CONNECTION_LENGTH];
 
 RestAPIEndpoints apiEndPoints;
 RdWebServer* webServer;
 
 byte CurrentLocation[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 byte CurrentRegionID = 0;
+
+DHT dht(SENSOR_DHT_PIN, SENSOR_DHT_TYPE);
+float RecordedTemperature = 0;
+float RecordedHumidity = 0;
 
 void cloneConstChar(const char* src, char* dest) {
   int length = strlen(src);
@@ -112,7 +133,7 @@ String servicesToArrayString() {
   return arr;
 }
 
-static int bigRandom(uint8_t *destination, unsigned size) {
+static int randomBytes(uint8_t *destination, unsigned size) {
   for (int i = 0; i < size; i++) {
     byte value = 0;
     for (int j = 0; j < 8; j++) {
@@ -346,8 +367,11 @@ bool fogPostSignSubmitTransaction(String path, String body) {
       return true;
     }
 
+    delete signatures, r, s, vHex;
     delay(1000);
   }
+
+  delete txHash, publicKey;
 
   Particle.publish("TX_SUBMIT_FAIL", txHashStr);
   return false;
@@ -361,6 +385,7 @@ bool testHostname(String hostname) {
 void testFogUpdateState() {
   if (FogAPIHostName != "" && testHostname(FogAPIHostName)) {
     setState(STATE_IDLE);
+    checkRegion();
   } else {
     setState(STATE_LOST);
   }
@@ -384,6 +409,10 @@ void updateRegionID(byte newID) {
 }
 
 void checkRegion() {
+  if (!validLocation(CurrentLocation)) {
+    return;
+  }
+
   JSONValue data;
   if (fogApiGetData("/region/query/" + bytesToHex(CurrentLocation, 8), &data)) {
     int regionID;
@@ -404,6 +433,11 @@ void setLocation(byte* location) {
     CurrentLocation[i] = location[i];
   }
   ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("LOCATION_UPDATED", bytesToHex(CurrentLocation, 8));
+
+  if (CurrentState != STATE_IDLE) {
+    return;
+  }
+
   checkRegion();
 
   fogPostSignSubmitTransaction("/device/update/location/tx", "{\"location\":\"" + bytesToHex(CurrentLocation, 8) + "\"}");
@@ -450,6 +484,98 @@ void registerDeviceToFog() {
     + "\"services\":" + servicesToArrayString() + "}";
   
   fogPostSignSubmitTransaction("/device/register/tx", body);
+}
+
+bool tokenIdentical(byte* token1, byte* token2) {
+  for (int i = 0; i < 8; i++) {
+    if (token1[i] != token2[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int getServiceConnectionIndex(byte* token) {
+  for (int i = 0; i < MAX_CONNECTION_LENGTH; i++) {
+    if (ServiceConnections[i] == NULL) {
+      continue;
+    }
+    if (tokenIdentical(token, ServiceConnections[i]->token)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int getServiceIndex(String *search) {
+  for (int i = 0; i < ServiceLength; i++) {
+    if (Services[i].compareTo(*search) == 0) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+int startService(int serviceIndex, int durationSec) {
+  byte* token = new byte[8];
+  do {
+    randomBytes(token, 8);
+    if (getServiceConnectionIndex(token) == -1) {
+      break;
+    }
+  } while (true);
+  
+  for (int i = 0; i < MAX_CONNECTION_LENGTH; i++) {
+    if (ServiceConnections[i] == NULL) {
+      ServiceConnections[i] = new ServiceConnection();
+      ServiceConnections[i]->token = token;
+      ServiceConnections[i]->serviceIndex = serviceIndex;
+      ServiceConnections[i]->expiration = Time.now() + durationSec;
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+void stopServiceConnection(int serviceConnectionIndex) {
+  JSONValue* data;
+  String serviceName = Services[ServiceConnections[serviceConnectionIndex]->serviceIndex];
+  String token = bytesToHex(ServiceConnections[serviceConnectionIndex]->token, 8);
+  fogApiPostData("/service/close", "{\"service\":\"" + serviceName + "\",\"token\":\"" + token + "\"}", data);
+  delete ServiceConnections[serviceConnectionIndex]->token;
+  delete ServiceConnections[serviceConnectionIndex];
+  ServiceConnections[serviceConnectionIndex] = NULL;
+}
+
+void serviceFunctionTemp(String &responseData) {
+  float value = dht.readTemperature(false, true);
+  if (isnan(value)) {
+    value = RecordedTemperature;
+  } else {
+    RecordedTemperature = value;
+  }
+  responseData = "{\"value\":" + String(value) + ",\"unit\":\"celcius\"}";
+}
+
+void serviceFunctionHumd(String &responseData) {
+  float value = dht.readHumidity(true);
+  if (isnan(value)) {
+    value = RecordedHumidity;
+  } else {
+    value /= 100.0;
+    RecordedHumidity = value;
+  }
+  responseData = "{\"value\":" + String(value) + "}";
+}
+
+void checkExpiredConnections() {
+  for (int i = 0; i < MAX_CONNECTION_LENGTH; i++) {
+    if (ServiceConnections[i] != NULL && Time.now() > ServiceConnections[i]->expiration) {
+      stopServiceConnection(i);
+    }
+  }
 }
 
 void apiReturnSuccess(String& response, char* data) {
@@ -541,7 +667,9 @@ void apiSetLocation(RestAPIEndpointMsg& request, String& response) {
   }
   apiReturnSuccess(response, NULL);
 
-  setLocation(hexToBytes(cellHex));
+  byte* location = hexToBytes(cellHex);
+  setLocation(location);
+  delete location;
 }
 
 void apiSetEthAccount(RestAPIEndpointMsg& request, String& response) {
@@ -567,15 +695,109 @@ void apiSetEthAccount(RestAPIEndpointMsg& request, String& response) {
   for (int i = 0; i < 32; i++) {
     EthPrivate[i] = privateKeyBytes[i];
   }
+  delete privateKeyBytes;
   EthAddress = address;
 
   RegisteredChecked = false;
   apiReturnSuccess(response, NULL);
 }
 
+void apiListServices(RestAPIEndpointMsg& request, String& response) {
+  ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("API_SERVICES_LIST");
+  if (!apiRequireMethod(request, response, API_METHOD_GET) || !apiRequireState(request, response, STATE_IDLE)) {
+    return;
+  }
+
+  String data = "[";
+  for (int i = 0; i < ServiceLength; i++) {
+    if (i > 0) {
+      data += ",";
+    }
+    data += "\"" + Services[i] + "\"";
+  }
+  return apiReturnSuccess(response, (char*)data.c_str());
+}
+
+void apiStartService(RestAPIEndpointMsg& request, String& response) {
+  ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("API_SERVICE_START");
+  if (!apiRequireMethod(request, response, API_METHOD_POST) || !apiRequireState(request, response, STATE_IDLE)) {
+    return;
+  }
+
+  JSONValue value = JSONValue::parseCopy((char*)request._pMsgContent);
+  String service;
+  int durationSec;
+  if (!JSONGetString(&value, "service", &service)
+    || !JSONGetInt(&value, "durationSec", &durationSec)) {
+    return apiReturnInvalidInput(response);
+  }
+
+  int serviceIndex = getServiceIndex(&service);
+  if (serviceIndex < 0) {
+    return apiReturnFail(response, "No service", NULL);
+  }
+  int connectionIndex = startService(serviceIndex, durationSec);
+  if (connectionIndex < 0) {
+    return apiReturnFail(response, "Error", NULL);
+  }
+
+  String token = bytesToHex(ServiceConnections[connectionIndex]->token, 8);
+  response = "{\"token\":\"" + token + "\"}";
+}
+
+void apiGetService(RestAPIEndpointMsg& request, String& response) {
+  ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("API_SERVICE_GET");
+  if (!apiRequireMethod(request, response, API_METHOD_GET) || !apiRequireState(request, response, STATE_IDLE)) {
+    return;
+  }
+
+  String tokenHex = request._pArgStr;
+  if (tokenHex.length() != 18) {
+    return apiReturnFail(response, "Invalid Token", NULL);
+  }
+  byte* token = hexToBytes(tokenHex);
+  int connectionIndex = getServiceConnectionIndex(token);
+  delete token;
+  if (connectionIndex < 0) {
+    return apiReturnFail(response, "Invalid token", NULL);
+  }
+
+  String data = "";
+  JSONValue jsonData;
+  ServiceFunctions[ServiceConnections[connectionIndex]->serviceIndex](data);
+  String serviceName = Services[ServiceConnections[connectionIndex]->serviceIndex];
+  fogApiPostData("/service/data", "{\"service\":\"" + serviceName + "\",\"data\":" + data + "}", &jsonData);
+  return apiReturnSuccess(response, (char*)data.c_str());
+}
+
+void apiStopService(RestAPIEndpointMsg& request, String& response) {
+  ((VERBOSITY) & (VERBOSITY_DEBUG)) && Particle.publish("API_SERVICE_STOP");
+  if (!apiRequireMethod(request, response, API_METHOD_POST) || !apiRequireState(request, response, STATE_IDLE)) {
+    return;
+  }
+
+  JSONValue body = JSONValue::parseCopy((char*)request._pMsgContent);
+  String tokenHex;
+  if (!JSONGetString(&body, "token", &tokenHex)) {
+    return apiReturnInvalidInput(response);
+  }
+  byte* token = hexToBytes(tokenHex);
+  delete token;
+  int connectionIndex = getServiceConnectionIndex(token);
+  if (connectionIndex < 0) {
+    return apiReturnFail(response, "Invalid token", NULL);
+  }
+
+  stopServiceConnection(connectionIndex);
+  return apiReturnSuccess(response, NULL);
+}
+
 void setup() {
   ((VERBOSITY) & (VERBOSITY_GENERAL)) && Particle.publish("DEVICE_START");
-  uECC_set_rng(&bigRandom);
+  uECC_set_rng(&randomBytes);
+  ServiceFunctions[0] = &serviceFunctionTemp;
+  ServiceFunctions[1] = &serviceFunctionHumd;
+  dht.begin();
   setupAPI();
   testFogUpdateState();
 }
@@ -601,6 +823,10 @@ void setupAPI() {
   apiEndPoints.addEndpoint("get-location", RestAPIEndpointDef::ENDPOINT_CALLBACK, apiGetLocation, "", "");
   apiEndPoints.addEndpoint("set-location", RestAPIEndpointDef::ENDPOINT_CALLBACK, apiSetLocation, "", "");
   apiEndPoints.addEndpoint("set-eth", RestAPIEndpointDef::ENDPOINT_CALLBACK, apiSetEthAccount, "", "");
+  apiEndPoints.addEndpoint("list-services", RestAPIEndpointDef::ENDPOINT_CALLBACK, apiListServices, "", "");
+  apiEndPoints.addEndpoint("start-service", RestAPIEndpointDef::ENDPOINT_CALLBACK, apiStartService, "", "");
+  apiEndPoints.addEndpoint("get-service", RestAPIEndpointDef::ENDPOINT_CALLBACK, apiGetService, "", "");
+  apiEndPoints.addEndpoint("stop-service", RestAPIEndpointDef::ENDPOINT_CALLBACK, apiStopService, "", "");
 
   webServer = new RdWebServer();
   webServer->addRestAPIEndpoints(&apiEndPoints);
@@ -625,5 +851,10 @@ void loopIdle() {
       registerDeviceToFog();
     }
   }
+
+  if (Time.second() % 10 == 0) {
+    checkExpiredConnections();
+  }
+
   webServer->service();
 }
