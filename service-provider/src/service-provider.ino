@@ -742,7 +742,7 @@ void apiStartService(RestAPIEndpointMsg& request, String& response) {
   }
 
   String token = bytesToHex(ServiceConnections[connectionIndex]->token, 8);
-  response = "{\"token\":\"" + token + "\"}";
+  response = "{\"ok\":true,\"msg\":null,\"data\":{\"token\":\"" + token + "\"}}";
 }
 
 void apiGetService(RestAPIEndpointMsg& request, String& response) {

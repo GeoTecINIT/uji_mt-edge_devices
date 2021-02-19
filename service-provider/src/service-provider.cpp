@@ -143,6 +143,8 @@ byte CurrentLocation[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 byte CurrentRegionID = 0;
 
 DHT dht(SENSOR_DHT_PIN, SENSOR_DHT_TYPE);
+float RecordedTemperature = 0;
+float RecordedHumidity = 0;
 
 void cloneConstChar(const char* src, char* dest) {
   int length = strlen(src);
@@ -622,11 +624,24 @@ void stopServiceConnection(int serviceConnectionIndex) {
 }
 
 void serviceFunctionTemp(String &responseData) {
-  responseData = "20";
+  float value = dht.readTemperature(false, true);
+  if (isnan(value)) {
+    value = RecordedTemperature;
+  } else {
+    RecordedTemperature = value;
+  }
+  responseData = "{\"value\":" + String(value) + ",\"unit\":\"celcius\"}";
 }
 
 void serviceFunctionHumd(String &responseData) {
-  responseData = "60";
+  float value = dht.readHumidity(true);
+  if (isnan(value)) {
+    value = RecordedHumidity;
+  } else {
+    value /= 100.0;
+    RecordedHumidity = value;
+  }
+  responseData = "{\"value\":" + String(value) + "}";
 }
 
 void checkExpiredConnections() {
@@ -801,7 +816,7 @@ void apiStartService(RestAPIEndpointMsg& request, String& response) {
   }
 
   String token = bytesToHex(ServiceConnections[connectionIndex]->token, 8);
-  response = "{\"token\":\"" + token + "\"}";
+  response = "{\"ok\":true,\"msg\":null,\"token\":\"" + token + "\"}";
 }
 
 void apiGetService(RestAPIEndpointMsg& request, String& response) {
@@ -856,6 +871,7 @@ void setup() {
   uECC_set_rng(&randomBytes);
   ServiceFunctions[0] = &serviceFunctionTemp;
   ServiceFunctions[1] = &serviceFunctionHumd;
+  dht.begin();
   setupAPI();
   testFogUpdateState();
 }
